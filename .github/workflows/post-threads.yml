@@ -1,0 +1,152 @@
+name: Post ke Threads itsnauraca
+
+# ============================================================
+#  SATU FILE, LANGSUNG JALAN.
+#  Cara pakai:
+#   1) Simpan file ini di repo kamu sebagai:  .github/workflows/post-threads.yml
+#   2) Repo → Settings → Secrets and variables → Actions → New repository secret
+#        Name  : THREADS_ACCESS_TOKEN
+#        Value : (token panjang Threads kamu)
+#   3) Tab "Actions" → pilih "Post ke Threads itsnauraca" → "Run workflow"
+#        - text  : isi narasi
+#        - reply : (opsional) daftar affiliate link
+#   4) Hasil (link Threads) muncul di ringkasan run.
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: "Isi narasi / caption post"
+        required: true
+        type: string
+      reply:
+        description: "Teks reply pertama (opsional, mis. daftar affiliate link)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tulis script poster
+        run: |
+          cat > threads_post.py <<'PYEOF'
+          import argparse, json, os, sys, time
+          from urllib import parse, request, error
+
+          GRAPH = "https://graph.threads.net/v1.0"
+          TEXT_LIMIT = 500
+
+          def _post(url, data):
+              body = parse.urlencode(data).encode()
+              req = request.Request(url, data=body, method="POST")
+              try:
+                  with request.urlopen(req, timeout=60) as r:
+                      return json.loads(r.read().decode())
+              except error.HTTPError as e:
+                  raise SystemExit(f"[Threads API error {e.code}] {e.read().decode(errors='replace')}")
+
+          def _get(url):
+              try:
+                  with request.urlopen(url, timeout=60) as r:
+                      return json.loads(r.read().decode())
+              except error.HTTPError as e:
+                  raise SystemExit(f"[Threads API error {e.code}] {e.read().decode(errors='replace')}")
+
+          def creds():
+              token = os.environ.get("THREADS_ACCESS_TOKEN")
+              if not token:
+                  raise SystemExit("THREADS_ACCESS_TOKEN belum di-set (cek GitHub Secret).")
+              uid = os.environ.get("THREADS_USER_ID")
+              if not uid:
+                  me = _get(f"{GRAPH}/me?fields=id,username&access_token={parse.quote(token)}")
+                  uid = me.get("id")
+                  if not uid:
+                      raise SystemExit(f"Gagal ambil user id dari token: {me}")
+                  print(f"user id: {uid} (@{me.get('username','')})", file=sys.stderr)
+              return uid, token
+
+          def wait_ready(cid, token, tries=20, delay=5):
+              url = f"{GRAPH}/{cid}?fields=status,error_message&access_token={parse.quote(token)}"
+              for _ in range(tries):
+                  res = _get(url)
+                  if res.get("status") == "FINISHED":
+                      return
+                  if res.get("status") == "ERROR":
+                      raise SystemExit(f"Container gagal: {res.get('error_message')}")
+                  time.sleep(delay)
+
+          def create_text(uid, token, text, reply_to=None):
+              d = {"media_type": "TEXT", "text": text, "access_token": token}
+              if reply_to:
+                  d["reply_to_id"] = reply_to
+              return _post(f"{GRAPH}/{uid}/threads", d)["id"]
+
+          def publish(uid, token, cid):
+              return _post(f"{GRAPH}/{uid}/threads_publish", {"creation_id": cid, "access_token": token})["id"]
+
+          def permalink(mid, token):
+              return _get(f"{GRAPH}/{mid}?fields=permalink&access_token={parse.quote(token)}").get("permalink")
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--text", required=True)
+              ap.add_argument("--reply", default=None)
+              ap.add_argument("--json", action="store_true")
+              a = ap.parse_args()
+              text = a.text.replace("\\n", "\n")
+              reply = a.reply.replace("\\n", "\n") if a.reply else None
+              uid, token = creds()
+              if len(text) > TEXT_LIMIT:
+                  print(f"WARN: caption {len(text)} char > {TEXT_LIMIT}", file=sys.stderr)
+              cid = create_text(uid, token, text)
+              wait_ready(cid, token)
+              mid = publish(uid, token, cid)
+              res = {"media_id": mid, "permalink": permalink(mid, token), "text": text}
+              if reply:
+                  time.sleep(2)
+                  rcid = create_text(uid, token, reply, reply_to=mid)
+                  wait_ready(rcid, token)
+                  rid = publish(uid, token, rcid)
+                  res["reply_media_id"] = rid
+                  res["reply_permalink"] = permalink(rid, token)
+              if a.json:
+                  print(json.dumps(res, ensure_ascii=False, indent=2))
+              else:
+                  print("OK:", res.get("permalink"))
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          echo "script siap"
+
+      - name: Publish ke Threads
+        env:
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+          POST_TEXT: ${{ inputs.text }}
+          POST_REPLY: ${{ inputs.reply }}
+        run: |
+          if [ -n "$POST_REPLY" ]; then
+            python3 threads_post.py --text "$POST_TEXT" --reply "$POST_REPLY" --json | tee result.json
+          else
+            python3 threads_post.py --text "$POST_TEXT" --json | tee result.json
+          fi
+
+      - name: Tampilkan hasil di ringkasan
+        if: always()
+        run: |
+          echo "### Hasil post Threads" >> $GITHUB_STEP_SUMMARY
+          if [ -f result.json ]; then
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat result.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Tidak ada hasil — cek log step Publish." >> $GITHUB_STEP_SUMMARY
+          fi
