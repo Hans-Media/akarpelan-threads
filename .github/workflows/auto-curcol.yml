@@ -1,0 +1,198 @@
+name: Auto Curcol itsnauraca
+
+# ============================================================
+#  Auto-post konten CURCOL (organik, tanpa produk) di jam RANDOM.
+#  - Jalan tiap jam (08:00-22:00 WIB), tapi tiap jam DIACAK apakah posting.
+#  - Rata-rata 1-5 post/hari, dijamin minimal 1/hari.
+#  - Ngambil dari content/curcol.txt (dipisah baris "---").
+#  - Nyimpen progres di content/state.json (otomatis).
+#  Setup: butuh file ini + content/curcol.txt + secret THREADS_ACCESS_TOKEN.
+# ============================================================
+
+on:
+  schedule:
+    - cron: "0 1-15 * * *"   # tiap jam, 01:00-15:00 UTC = 08:00-22:00 WIB
+  workflow_dispatch:          # bisa juga dipicu manual buat tes
+
+permissions:
+  contents: write             # buat commit balik state.json
+
+concurrency:
+  group: auto-curcol
+  cancel-in-progress: false
+
+jobs:
+  maybe-post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tulis script
+        run: |
+          cat > auto_post.py <<'PYEOF'
+          import json, os, sys, time, random
+          from datetime import datetime, timedelta
+          from urllib import parse, request, error
+
+          GRAPH = "https://graph.threads.net/v1.0"
+          CONTENT = "content/curcol.txt"
+          STATE = "content/state.json"
+
+          # ---- parameter perilaku ----
+          ACTIVE_START, ACTIVE_END = 8, 22   # jam WIB aktif [start, end)
+          DAILY_MAX = 5                      # maksimal post per hari
+          MIN_GAP_MIN = 90                   # jeda minimal antar post (menit)
+          PROB = 0.30                        # peluang posting tiap run
+          FLOOR_HOUR = 20                    # kalau jam ini & belum posting hari ini -> paksa 1x
+
+          def _post(url, data):
+              req = request.Request(url, data=parse.urlencode(data).encode(), method="POST")
+              try:
+                  with request.urlopen(req, timeout=60) as r:
+                      return json.loads(r.read().decode())
+              except error.HTTPError as e:
+                  raise SystemExit(f"[Threads API {e.code}] {e.read().decode(errors='replace')}")
+
+          def _get(url):
+              try:
+                  with request.urlopen(url, timeout=60) as r:
+                      return json.loads(r.read().decode())
+              except error.HTTPError as e:
+                  raise SystemExit(f"[Threads API {e.code}] {e.read().decode(errors='replace')}")
+
+          def creds():
+              token = os.environ.get("THREADS_ACCESS_TOKEN")
+              if not token:
+                  raise SystemExit("THREADS_ACCESS_TOKEN belum di-set.")
+              uid = os.environ.get("THREADS_USER_ID")
+              if not uid:
+                  me = _get(f"{GRAPH}/me?fields=id&access_token={parse.quote(token)}")
+                  uid = me.get("id")
+              return uid, token
+
+          def publish(text):
+              uid, token = creds()
+              cid = _post(f"{GRAPH}/{uid}/threads",
+                          {"media_type": "TEXT", "text": text, "access_token": token})["id"]
+              # tunggu container siap
+              for _ in range(20):
+                  st = _get(f"{GRAPH}/{cid}?fields=status&access_token={parse.quote(token)}").get("status")
+                  if st == "FINISHED":
+                      break
+                  if st == "ERROR":
+                      raise SystemExit("Container ERROR")
+                  time.sleep(5)
+              mid = _post(f"{GRAPH}/{uid}/threads_publish",
+                          {"creation_id": cid, "access_token": token})["id"]
+              link = _get(f"{GRAPH}/{mid}?fields=permalink&access_token={parse.quote(token)}").get("permalink")
+              return mid, link
+
+          def load_posts():
+              if not os.path.isfile(CONTENT):
+                  raise SystemExit(f"{CONTENT} nggak ada.")
+              raw = open(CONTENT, encoding="utf-8").read()
+              parts = [p.strip() for p in raw.split("\n---\n")]
+              return [p for p in parts if p]
+
+          def load_state():
+              if os.path.isfile(STATE):
+                  try:
+                      return json.load(open(STATE, encoding="utf-8"))
+                  except Exception:
+                      pass
+              return {"date": "", "count": 0, "last_iso": "", "order": [], "pos": 0}
+
+          def save_state(s):
+              os.makedirs(os.path.dirname(STATE), exist_ok=True)
+              json.dump(s, open(STATE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+          def main():
+              forced_dispatch = os.environ.get("FORCE_POST") == "1"
+              posts = load_posts()
+              n = len(posts)
+              s = load_state()
+              now = datetime.utcnow() + timedelta(hours=7)  # WIB
+              today = now.strftime("%Y-%m-%d")
+              if s.get("date") != today:
+                  s["date"] = today
+                  s["count"] = 0
+
+              hour = now.hour
+              def gap_ok():
+                  if not s.get("last_iso"):
+                      return True
+                  try:
+                      last = datetime.fromisoformat(s["last_iso"])
+                  except Exception:
+                      return True
+                  return (now - last).total_seconds() >= MIN_GAP_MIN * 60
+
+              decide = False
+              reason = ""
+              if forced_dispatch:
+                  decide, reason = True, "manual dispatch"
+              elif hour < ACTIVE_START or hour >= ACTIVE_END:
+                  reason = "di luar jam aktif"
+              elif s["count"] >= DAILY_MAX:
+                  reason = "sudah mentok DAILY_MAX"
+              elif not gap_ok():
+                  reason = "belum lewat jeda minimal"
+              elif hour >= FLOOR_HOUR and s["count"] == 0:
+                  decide, reason = True, "floor: jamin minimal 1/hari"
+              elif random.random() < PROB:
+                  decide, reason = True, "lolos undian"
+              else:
+                  reason = "nggak kepilih undian jam ini"
+
+              print(f"[{now:%Y-%m-%d %H:%M} WIB] count={s['count']} decide={decide} ({reason})")
+
+              if not decide:
+                  save_state(s)
+                  print("SKIP")
+                  return
+
+              # ambil post berikutnya (shuffle biar nggak berurutan)
+              if not s.get("order") or s.get("pos", 0) >= len(s["order"]) or len(s["order"]) != n:
+                  order = list(range(n)); random.shuffle(order)
+                  s["order"] = order; s["pos"] = 0
+              idx = s["order"][s["pos"]]
+              s["pos"] += 1
+              text = posts[idx]
+
+              mid, link = publish(text)
+              s["count"] += 1
+              s["last_iso"] = now.isoformat(timespec="seconds")
+              save_state(s)
+              print("POSTED", link)
+              with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a", encoding="utf-8") as f:
+                  f.write(f"### Auto curcol\nPosted: {link}\n\n> {text[:120]}...\n")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          echo "script siap"
+
+      - name: Jalankan
+        env:
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+          FORCE_POST: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python3 auto_post.py
+
+      - name: Simpan progres (commit state)
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain content/state.json)" ]; then
+            git config user.name "itsnauraca-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add content/state.json
+            git commit -m "chore: update state [skip ci]"
+            git push
+          else
+            echo "state.json tidak berubah, skip commit"
+          fi
