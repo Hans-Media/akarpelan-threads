@@ -1,18 +1,20 @@
 name: Publish dari Notion (auto affiliate)
 
 # ============================================================
-#  Jembatan: Claude nulis post ke Notion (Status="Siap Post"),
-#  workflow ini ngecek Notion tiap 30 menit (jam aktif WIB),
-#  publish yang "Siap Post" ke Threads, lalu update row jadi
-#  "Published" + isi link Threads. Hans nggak operate apa-apa.
-#
-#  Butuh 2 secret: THREADS_ACCESS_TOKEN (udah ada) + NOTION_TOKEN (baru).
+#  Jembatan Notion -> Threads, dengan REM DRIP + THREAD berantai.
+#  - Cek Notion tiap 30 menit (jam aktif WIB).
+#  - Maks ~1-2 post/hari, jam acak, jeda antar post kejaga.
+#  - Tiap "post" bisa berupa THREAD: caption + beberapa reply cerita,
+#    lalu 1 reply terakhir isi semua link. Dikontrol lewat field:
+#      * Narasi  = bagian thread, dipisah baris "===" (bagian 1 = post utama, sisanya reply cerita).
+#      * Reply   = reply TERAKHIR (biasanya kumpulan link). Boleh kosong.
+#  Butuh 2 secret: THREADS_ACCESS_TOKEN + NOTION_TOKEN.
 # ============================================================
 
 on:
   schedule:
     - cron: "*/30 1-15 * * *"   # tiap 30 menit, 08:00-22:00 WIB
-  workflow_dispatch:             # buat tes manual / publish langsung
+  workflow_dispatch:             # tes manual = paksa 1 post (abaikan drip)
 
 permissions:
   contents: read
@@ -30,10 +32,11 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
           NOTION_DB_ID: "073e2a4c683044179099884dcfff79d3"
+          FORCE_POST: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           cat > pub.py <<'PYEOF'
-          import json, os, time
-          from datetime import datetime, timedelta
+          import json, os, time, random
+          from datetime import datetime, timezone, timedelta
           from urllib import request, error, parse
 
           NOTION = "https://api.notion.com/v1"
@@ -41,6 +44,14 @@ jobs:
           DB = os.environ["NOTION_DB_ID"]
           NT = os.environ["NOTION_TOKEN"]
           TT = os.environ["THREADS_ACCESS_TOKEN"]
+          FORCE = os.environ.get("FORCE_POST") == "1"
+
+          # ---- rem drip ----
+          DAILY_MAX = 2            # maks affiliate post per hari
+          MIN_GAP_MIN = 180        # jeda minimal antar affiliate post (menit)
+          PROB = 0.45              # peluang posting tiap run (kalau lolos cap & gap)
+
+          WIB = timezone(timedelta(hours=7))
 
           def notion(method, path, data=None):
               body = json.dumps(data).encode() if data is not None else None
@@ -82,54 +93,112 @@ jobs:
                       raise RuntimeError("container ERROR")
                   time.sleep(5)
 
-          def publish(u, text, reply):
-              cid = th_post(f"{GRAPH}/{u}/threads", {"media_type": "TEXT", "text": text, "access_token": TT})["id"]
+          def post_one(u, text, reply_to=None):
+              data = {"media_type": "TEXT", "text": text, "access_token": TT}
+              if reply_to:
+                  data["reply_to_id"] = reply_to
+              cid = th_post(f"{GRAPH}/{u}/threads", data)["id"]
               wait_ready(cid)
-              mid = th_post(f"{GRAPH}/{u}/threads_publish", {"creation_id": cid, "access_token": TT})["id"]
-              link = th_get(f"{GRAPH}/{mid}?fields=permalink&access_token={parse.quote(TT)}").get("permalink")
-              if reply and reply.strip():
-                  time.sleep(2)
-                  rcid = th_post(f"{GRAPH}/{u}/threads",
-                                 {"media_type": "TEXT", "text": reply, "reply_to_id": mid, "access_token": TT})["id"]
-                  wait_ready(rcid)
-                  th_post(f"{GRAPH}/{u}/threads_publish", {"creation_id": rcid, "access_token": TT})
-              return link
+              return th_post(f"{GRAPH}/{u}/threads_publish", {"creation_id": cid, "access_token": TT})["id"]
 
-          def main():
-              q = notion("POST", f"/databases/{DB}/query",
-                         {"filter": {"property": "Status", "select": {"equals": "Siap Post"}},
-                          "page_size": 5})
-              rows = q.get("results", [])
-              if not rows:
-                  print("Nggak ada yang 'Siap Post'.")
-                  return
-              u = uid()
-              now = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%dT%H:%M:%S+07:00")
-              done = 0
-              for row in rows:
-                  pid = row["id"]
-                  props = row["properties"]
-                  text = rich(props.get("Narasi"))
-                  reply = rich(props.get("Reply"))
-                  judul = rich(props.get("Judul / Produk"))
-                  if not text.strip():
-                      print(f"skip (Narasi kosong): {judul}")
+          def permalink(mid):
+              return th_get(f"{GRAPH}/{mid}?fields=permalink&access_token={parse.quote(TT)}").get("permalink")
+
+          def publish_thread(u, parts, links_reply):
+              prev = None
+              main_link = None
+              for i, part in enumerate(parts):
+                  if not part.strip():
+                      continue
+                  mid = post_one(u, part, reply_to=prev)
+                  if main_link is None:
+                      main_link = permalink(mid)
+                  prev = mid
+                  time.sleep(2)
+              if links_reply and links_reply.strip():
+                  post_one(u, links_reply, reply_to=prev)
+              return main_link
+
+          def today_published():
+              q = notion("POST", f"/databases/{DB}/query", {
+                  "filter": {"property": "Status", "select": {"equals": "Published"}},
+                  "sorts": [{"property": "Tanggal Post", "direction": "descending"}],
+                  "page_size": 15,
+              })
+              now = datetime.now(timezone.utc).astimezone(WIB)
+              today = now.date()
+              count = 0
+              latest = None
+              for r in q.get("results", []):
+                  d = (r["properties"].get("Tanggal Post") or {}).get("date")
+                  if not d or not d.get("start"):
                       continue
                   try:
-                      link = publish(u, text, reply)
-                      notion("PATCH", f"/pages/{pid}", {"properties": {
-                          "Status": {"select": {"name": "Published"}},
-                          "Link Threads": {"url": link},
-                          "Tanggal Post": {"date": {"start": now}},
-                      }})
-                      print(f"PUBLISHED: {judul} -> {link}")
-                      done += 1
-                  except Exception as e:
-                      print(f"GAGAL: {judul} :: {e}")
-              summ = os.environ.get("GITHUB_STEP_SUMMARY")
-              if summ:
-                  with open(summ, "a", encoding="utf-8") as f:
-                      f.write(f"### Publish dari Notion\n{done} post terpublish dari antrian.\n")
+                      dt = datetime.fromisoformat(d["start"])
+                  except Exception:
+                      continue
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=WIB)
+                  dt = dt.astimezone(WIB)
+                  if dt.date() == today:
+                      count += 1
+                  if latest is None or dt > latest:
+                      latest = dt
+              return count, latest, now
+
+          def next_queued():
+              q = notion("POST", f"/databases/{DB}/query", {
+                  "filter": {"property": "Status", "select": {"equals": "Siap Post"}},
+                  "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
+                  "page_size": 1,
+              })
+              rows = q.get("results", [])
+              return rows[0] if rows else None
+
+          def main():
+              row = next_queued()
+              if not row:
+                  print("Antrian 'Siap Post' kosong.")
+                  return
+
+              if not FORCE:
+                  count, latest, now = today_published()
+                  if count >= DAILY_MAX:
+                      print(f"SKIP: udah {count} post hari ini (cap {DAILY_MAX}).")
+                      return
+                  if latest and (now - latest).total_seconds() < MIN_GAP_MIN * 60:
+                      print("SKIP: belum lewat jeda minimal antar post.")
+                      return
+                  if random.random() >= PROB:
+                      print("SKIP: nggak kepilih undian jam ini.")
+                      return
+
+              props = row["properties"]
+              pid = row["id"]
+              judul = rich(props.get("Judul / Produk"))
+              narasi = rich(props.get("Narasi"))
+              links_reply = rich(props.get("Reply"))
+              parts = [p for p in narasi.split("\n===\n")]
+              if not any(p.strip() for p in parts):
+                  print(f"SKIP: Narasi kosong ({judul}).")
+                  return
+
+              u = uid()
+              now_iso = datetime.now(timezone.utc).astimezone(WIB).strftime("%Y-%m-%dT%H:%M:%S+07:00")
+              try:
+                  link = publish_thread(u, parts, links_reply)
+                  notion("PATCH", f"/pages/{pid}", {"properties": {
+                      "Status": {"select": {"name": "Published"}},
+                      "Link Threads": {"url": link},
+                      "Tanggal Post": {"date": {"start": now_iso}},
+                  }})
+                  print(f"PUBLISHED: {judul} -> {link}")
+                  summ = os.environ.get("GITHUB_STEP_SUMMARY")
+                  if summ:
+                      with open(summ, "a", encoding="utf-8") as f:
+                          f.write(f"### Publish dari Notion\nPUBLISHED: {judul}\n{link}\n")
+              except Exception as e:
+                  print(f"GAGAL: {judul} :: {e}")
 
           if __name__ == "__main__":
               main()
