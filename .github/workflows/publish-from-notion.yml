@@ -51,6 +51,10 @@ jobs:
           MIN_GAP_MIN = 180        # jeda minimal antar affiliate post (menit)
           PROB = 0.45              # peluang posting tiap run (kalau lolos cap & gap)
 
+          # ---- prioritas kategori (deteksi dari field Catatan) ----
+          PRIORITY_TAG = "17 Agustus"   # substring penanda konten 17-an (di properti Catatan)
+          PRIORITY_WEIGHT = 0.75        # 75:25 -> 75% ambil dari pool UMUM/CEWE, 25% dari pool 17-an
+
           WIB = timezone(timedelta(hours=7))
 
           def notion(method, path, data=None):
@@ -146,20 +150,42 @@ jobs:
                       latest = dt
               return count, latest, now
 
-          def next_queued():
+          def oldest_where(extra_filter):
               q = notion("POST", f"/databases/{DB}/query", {
-                  "filter": {"property": "Status", "select": {"equals": "Siap Post"}},
+                  "filter": {"and": [
+                      {"property": "Status", "select": {"equals": "Siap Post"}},
+                      extra_filter,
+                  ]},
                   "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
                   "page_size": 1,
               })
               rows = q.get("results", [])
               return rows[0] if rows else None
 
+          def next_queued():
+              """Ambil antrian berikutnya dengan bobot PRIORITY_WEIGHT buat pool UMUM/CEWE
+              (Catatan-nya TIDAK mengandung PRIORITY_TAG), sisanya dari pool 17-an.
+              Kalau salah satu pool kosong, otomatis fallback ke pool yang masih ada isinya."""
+              priority_row = oldest_where({"property": "Catatan", "rich_text": {"contains": PRIORITY_TAG}})
+              general_row = oldest_where({"property": "Catatan", "rich_text": {"does_not_contain": PRIORITY_TAG}})
+
+              if priority_row and not general_row:
+                  return priority_row, "17-an (satu-satunya pool terisi)"
+              if general_row and not priority_row:
+                  return general_row, "umum/cewe (satu-satunya pool terisi)"
+              if not priority_row and not general_row:
+                  return None, None
+
+              if random.random() < PRIORITY_WEIGHT:
+                  return general_row, f"umum/cewe (menang undian {int(PRIORITY_WEIGHT*100)}:{int((1-PRIORITY_WEIGHT)*100)})"
+              return priority_row, f"17-an (menang undian {int((1-PRIORITY_WEIGHT)*100)}:{int(PRIORITY_WEIGHT*100)})"
+
           def main():
-              row = next_queued()
+              row, why = next_queued()
               if not row:
                   print("Antrian 'Siap Post' kosong.")
                   return
+              print(f"Pilih antrian: {why}")
 
               if not FORCE:
                   count, latest, now = today_published()
