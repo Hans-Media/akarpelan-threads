@@ -60,11 +60,23 @@ jobs:
                   raise SystemExit(f"[Threads API {e.code}] {e.read().decode(errors='replace')}")
 
           def _get(url):
-              try:
-                  with request.urlopen(url, timeout=60) as r:
-                      return json.loads(r.read().decode())
-              except error.HTTPError as e:
-                  raise SystemExit(f"[Threads API {e.code}] {e.read().decode(errors='replace')}")
+              with request.urlopen(url, timeout=60) as r:
+                  return json.loads(r.read().decode())
+
+          def _get_retry(url, tries=5, delay=4, label="request"):
+              """GET dengan retry -- Threads API kadang butuh beberapa detik sebelum
+              object yang baru dibuat/dipublish bisa di-query (eventual consistency),
+              jadi 'Media Not Found' di percobaan pertama itu wajar & bukan fatal."""
+              last_err = None
+              for attempt in range(1, tries + 1):
+                  try:
+                      return _get(url)
+                  except error.HTTPError as e:
+                      body = e.read().decode(errors="replace")
+                      last_err = f"[Threads API {e.code}] {body}"
+                      print(f"  ({label} percobaan {attempt}/{tries} gagal, retry dalam {delay}s) {last_err}")
+                      time.sleep(delay)
+              raise RuntimeError(f"{label} tetap gagal setelah {tries}x: {last_err}")
 
           def creds():
               token = os.environ.get("THREADS_ACCESS_TOKEN")
@@ -80,17 +92,38 @@ jobs:
               uid, token = creds()
               cid = _post(f"{GRAPH}/{uid}/threads",
                           {"media_type": "TEXT", "text": text, "access_token": token})["id"]
-              # tunggu container siap
+
+              # jeda kecil dulu -- container yang baru dibuat kadang belum langsung
+              # bisa di-query statusnya.
+              time.sleep(2)
+
+              # tunggu container siap (retry-tolerant terhadap "not found" sesaat)
               for _ in range(20):
-                  st = _get(f"{GRAPH}/{cid}?fields=status&access_token={parse.quote(token)}").get("status")
+                  st = _get_retry(
+                      f"{GRAPH}/{cid}?fields=status&access_token={parse.quote(token)}",
+                      tries=3, delay=4, label="cek status container",
+                  ).get("status")
                   if st == "FINISHED":
                       break
                   if st == "ERROR":
                       raise SystemExit("Container ERROR")
                   time.sleep(5)
+
               mid = _post(f"{GRAPH}/{uid}/threads_publish",
                           {"creation_id": cid, "access_token": token})["id"]
-              link = _get(f"{GRAPH}/{mid}?fields=permalink&access_token={parse.quote(token)}").get("permalink")
+
+              # Publish udah SUKSES di titik ini (mid valid) -- postingan sudah live.
+              # Ambil permalink itu best-effort aja, retry-tolerant, dan JANGAN
+              # dianggap gagal total kalau permalink-nya belum ke-index Meta.
+              link = None
+              try:
+                  link = _get_retry(
+                      f"{GRAPH}/{mid}?fields=permalink&access_token={parse.quote(token)}",
+                      tries=5, delay=5, label="ambil permalink",
+                  ).get("permalink")
+              except Exception as e:
+                  print(f"  (permalink belum bisa diambil, tapi post SUDAH live: {e})")
+
               return mid, link
 
           def load_posts():
@@ -124,6 +157,7 @@ jobs:
                   s["count"] = 0
 
               hour = now.hour
+
               def gap_ok():
                   if not s.get("last_iso"):
                       return True
@@ -161,17 +195,34 @@ jobs:
               if not s.get("order") or s.get("pos", 0) >= len(s["order"]) or len(s["order"]) != n:
                   order = list(range(n)); random.shuffle(order)
                   s["order"] = order; s["pos"] = 0
+
               idx = s["order"][s["pos"]]
-              s["pos"] += 1
               text = posts[idx]
 
-              mid, link = publish(text)
+              try:
+                  mid, link = publish(text)
+              except SystemExit:
+                  # Ini fatal beneran (container ERROR, token invalid, dll) --
+                  # JANGAN advance pos/count, biar teks yang sama dicoba lagi run berikutnya.
+                  save_state(s)
+                  raise
+
+              # Publish sukses (mid valid) -> baru sekarang advance progres,
+              # supaya teks yang sama nggak keulang di run berikutnya.
+              s["pos"] += 1
               s["count"] += 1
               s["last_iso"] = now.isoformat(timespec="seconds")
               save_state(s)
-              print("POSTED", link)
+
+              if link:
+                  print("POSTED", link)
+                  summary_line = f"### Auto curcol\nPosted: {link}\n\n> {text[:120]}...\n"
+              else:
+                  print("POSTED (permalink belum ke-fetch), id:", mid)
+                  summary_line = f"### Auto curcol\nPosted (ID: {mid}, permalink nyusul)\n\n> {text[:120]}...\n"
+
               with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a", encoding="utf-8") as f:
-                  f.write(f"### Auto curcol\nPosted: {link}\n\n> {text[:120]}...\n")
+                  f.write(summary_line)
 
           if __name__ == "__main__":
               main()
